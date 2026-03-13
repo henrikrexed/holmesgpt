@@ -57,6 +57,7 @@ from holmes.utils.log import EndpointFilter
 from holmes.checks.checks_api import init_checks_app
 from holmes.core.tools_utils.filesystem_result_storage import tool_result_storage
 from holmes.core.tracing import TracingFactory
+from holmes.core.otel_tracing import get_metrics
 from holmes.utils.stream import stream_chat_formatter
 
 # removed: add_runbooks_to_user_prompt
@@ -407,6 +408,10 @@ def chat(chat_request: ChatRequest, http_request: Request):
                 "holmesgpt.investigation.question": chat_request.ask[:1024],
                 "holmesgpt.investigation.stream": True,
             })
+            otel_metrics = get_metrics()
+            if otel_metrics:
+                inv_attrs = {"gen_ai.request.model": chat_request.model or config.model or "unknown"}
+                otel_metrics.investigation_count.add(1, inv_attrs)
 
             stream = stream_chat_formatter(
                 ai.call_stream(
@@ -435,12 +440,22 @@ def chat(chat_request: ChatRequest, http_request: Request):
                         "holmesgpt.investigation.question": chat_request.ask[:1024],
                     })
 
+                _inv_start = time.time()
                 llm_call = ai.messages_call(
                     messages=messages,
                     trace_span=trace_span,
                     response_format=chat_request.response_format,
                     request_context=request_context,
                 )
+
+                # Record investigation metrics
+                otel_metrics = get_metrics()
+                if otel_metrics:
+                    inv_attrs = {"gen_ai.request.model": chat_request.model or config.model or "unknown"}
+                    otel_metrics.investigation_count.add(1, inv_attrs)
+                    otel_metrics.investigation_duration.record(time.time() - _inv_start, inv_attrs)
+                    if hasattr(llm_call, "num_llm_calls") and llm_call.num_llm_calls:
+                        otel_metrics.investigation_iterations.record(llm_call.num_llm_calls, inv_attrs)
 
                 logging.info(f"Completed {req_info}")
                 response = ChatResponse(

@@ -2,6 +2,7 @@ import contextvars
 import concurrent.futures
 import json
 import logging
+import time
 import re
 import threading
 from pathlib import Path
@@ -477,6 +478,7 @@ class ToolCallingLLM:
             # (e.g. LiteLLM HTTP calls) become children of this gen_ai.chat span.
             llm_span = trace_span.start_span(name="gen_ai.chat")
             try:
+                _llm_call_start = time.time()
                 full_response = self.llm.completion(
                     messages=parse_messages_tags(messages),
                     tools=tools,
@@ -489,6 +491,18 @@ class ToolCallingLLM:
 
                 # Extract and accumulate cost information
                 _process_cost_info(full_response, costs, "LLM call")
+
+                # Record LLM metrics
+                otel_metrics = get_metrics()
+                if otel_metrics:
+                    raw = extract_usage_from_response(full_response)
+                    model_attrs = {"gen_ai.request.model": self.llm.model, "gen_ai.system": "litellm"}
+                    if raw.prompt_tokens > 0:
+                        otel_metrics.llm_input_tokens.add(raw.prompt_tokens, {**model_attrs, "gen_ai.token.type": "input"})
+                    if raw.completion_tokens > 0:
+                        otel_metrics.llm_input_tokens.add(raw.completion_tokens, {**model_attrs, "gen_ai.token.type": "output"})
+                    llm_duration = time.time() - _llm_call_start
+                    otel_metrics.llm_call_duration.record(llm_duration, model_attrs)
 
                 # Log GenAI semantic convention attributes on the LLM child span
                 llm_span.log(metadata={
@@ -832,6 +846,7 @@ class ToolCallingLLM:
             trace_span = DummySpan()
         # Extract tool name early for span naming
         tool_name_for_span = getattr(getattr(tool_to_call, "function", None), "name", "unknown_tool")
+        _tool_start = time.time()
         with trace_span.start_span(name=f"holmesgpt.tool.{tool_name_for_span}", type="tool") as tool_span:
             if not hasattr(tool_to_call, "function"):
                 # Handle the union type - ChatCompletionMessageToolCall can be either
@@ -869,6 +884,15 @@ class ToolCallingLLM:
                 "holmesgpt.tool.name": tool_call_result.tool_name,
                 "holmesgpt.tool.status": tool_call_result.result.status.value if tool_call_result.result.status else "unknown",
             })
+
+            # Record tool call metrics
+            otel_metrics = get_metrics()
+            if otel_metrics:
+                tool_attrs = {"holmesgpt.tool.name": tool_call_result.tool_name}
+                otel_metrics.tool_call_count.add(1, tool_attrs)
+                otel_metrics.tool_call_duration.record(time.time() - _tool_start, tool_attrs)
+                if tool_call_result.result.status and tool_call_result.result.status.value == "error":
+                    otel_metrics.tool_call_errors.add(1, tool_attrs)
 
             original_token_count = prevent_overly_big_tool_response(
                 tool_call_result=tool_call_result,
@@ -1051,6 +1075,7 @@ class ToolCallingLLM:
             # Create a child gen_ai.chat span for each LLM call iteration
             llm_span = trace_span.start_span(name="gen_ai.chat")
             try:
+                _llm_call_start = time.time()
                 full_response = self.llm.completion(
                     messages=parse_messages_tags(messages),  # type: ignore
                     tools=tools,
@@ -1063,6 +1088,17 @@ class ToolCallingLLM:
 
                 # Accumulate cost information for this iteration
                 _process_cost_info(full_response, costs, log_prefix="LLM iteration")
+
+                # Record LLM metrics (streaming path)
+                otel_metrics = get_metrics()
+                if otel_metrics:
+                    raw = extract_usage_from_response(full_response)
+                    model_attrs = {"gen_ai.request.model": self.llm.model, "gen_ai.system": "litellm"}
+                    if raw.prompt_tokens > 0:
+                        otel_metrics.llm_input_tokens.add(raw.prompt_tokens, {**model_attrs, "gen_ai.token.type": "input"})
+                    if raw.completion_tokens > 0:
+                        otel_metrics.llm_input_tokens.add(raw.completion_tokens, {**model_attrs, "gen_ai.token.type": "output"})
+                    otel_metrics.llm_call_duration.record(time.time() - _llm_call_start, model_attrs)
 
                 # Log GenAI attributes on the LLM child span
                 llm_span.log(metadata={

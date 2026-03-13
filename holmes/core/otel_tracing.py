@@ -1,4 +1,4 @@
-"""OpenTelemetry tracing implementation for HolmesGPT."""
+"""OpenTelemetry tracing and metrics implementation for HolmesGPT."""
 import logging
 import os
 from typing import Any, Dict, Optional
@@ -8,10 +8,14 @@ from holmes.core.tracing import DummySpan, SpanType
 try:
     from opentelemetry import context as otel_context
     from opentelemetry import trace
+    from opentelemetry import metrics
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.trace import StatusCode
 
     OTEL_AVAILABLE = True
@@ -28,6 +32,68 @@ GEN_AI_REQUEST_TEMPERATURE = "gen_ai.request.temperature"
 GEN_AI_USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
 GEN_AI_USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
 GEN_AI_USAGE_TOTAL_TOKENS = "gen_ai.usage.total_tokens"
+
+
+class OTelMetrics:
+    """Container for all HolmesGPT OTel metric instruments."""
+
+    def __init__(self, meter: Any):
+        # Token counters
+        self.llm_input_tokens = meter.create_counter(
+            name="gen_ai.client.token.usage",
+            description="Number of input/output tokens used by LLM calls",
+            unit="{token}",
+        )
+
+        # Investigation metrics
+        self.investigation_duration = meter.create_histogram(
+            name="holmesgpt.investigation.duration",
+            description="Duration of investigations in seconds",
+            unit="s",
+        )
+        self.investigation_count = meter.create_counter(
+            name="holmesgpt.investigation.count",
+            description="Number of investigations started",
+            unit="{investigation}",
+        )
+        self.investigation_iterations = meter.create_histogram(
+            name="holmesgpt.investigation.iterations",
+            description="Number of LLM iterations per investigation",
+            unit="{iteration}",
+        )
+
+        # LLM call metrics
+        self.llm_call_duration = meter.create_histogram(
+            name="gen_ai.client.operation.duration",
+            description="Duration of individual LLM calls in seconds",
+            unit="s",
+        )
+
+        # Tool/MCP metrics
+        self.tool_call_count = meter.create_counter(
+            name="holmesgpt.tool.call.count",
+            description="Number of tool/MCP calls",
+            unit="{call}",
+        )
+        self.tool_call_duration = meter.create_histogram(
+            name="holmesgpt.tool.call.duration",
+            description="Duration of tool/MCP calls in seconds",
+            unit="s",
+        )
+        self.tool_call_errors = meter.create_counter(
+            name="holmesgpt.tool.call.errors",
+            description="Number of tool/MCP call errors",
+            unit="{error}",
+        )
+
+
+# Global metrics instance — set by OpenTelemetryTracer.__init__
+_metrics: Optional[OTelMetrics] = None
+
+
+def get_metrics() -> Optional[OTelMetrics]:
+    """Get the global OTel metrics instance. Returns None if OTel is not active."""
+    return _metrics
 
 
 class OTelSpan:
@@ -118,31 +184,46 @@ class OpenTelemetryTracer:
     """OpenTelemetry implementation of Holmes tracing."""
 
     def __init__(self, service_name: str = "holmesgpt"):
+        global _metrics
+
         if not OTEL_AVAILABLE:
             raise ImportError(
                 "opentelemetry packages required. Install with: pip install 'holmesgpt[otel]'"
             )
 
         resource = Resource.create({"service.name": service_name})
-        provider = TracerProvider(resource=resource)
 
         endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
         headers_str = os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
         headers = _parse_otel_headers(headers_str)
         insecure = not endpoint.startswith("https://")
 
-        exporter = OTLPSpanExporter(
+        # --- Traces ---
+        trace_provider = TracerProvider(resource=resource)
+        trace_exporter = OTLPSpanExporter(
             endpoint=endpoint,
             insecure=insecure,
             headers=headers or None,
         )
-        provider.add_span_processor(BatchSpanProcessor(exporter))
-
-        # Set global provider BEFORE instrumenting httpx so the instrumentor
-        # picks up the same provider and traces link correctly
-        trace.set_tracer_provider(provider)
+        trace_provider.add_span_processor(BatchSpanProcessor(trace_exporter))
+        trace.set_tracer_provider(trace_provider)
         self._tracer = trace.get_tracer("holmesgpt", "0.1.0")
-        self._provider = provider
+        self._provider = trace_provider
+
+        # --- Metrics ---
+        metric_exporter = OTLPMetricExporter(
+            endpoint=endpoint,
+            insecure=insecure,
+            headers=headers or None,
+        )
+        metric_reader = PeriodicExportingMetricReader(
+            metric_exporter, export_interval_millis=30000
+        )
+        meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+        metrics.set_meter_provider(meter_provider)
+        self._meter_provider = meter_provider
+        meter = metrics.get_meter("holmesgpt", "0.1.0")
+        _metrics = OTelMetrics(meter)
 
         # Auto-instrument httpx for MCP trace context propagation.
         # Must happen AFTER set_tracer_provider so httpx spans use our provider.
@@ -179,6 +260,7 @@ class OpenTelemetryTracer:
 
     def shutdown(self) -> None:
         self._provider.shutdown()
+        self._meter_provider.shutdown()
 
 
 def _parse_otel_headers(headers_str: str) -> Dict[str, str]:

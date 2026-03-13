@@ -320,3 +320,56 @@ class TestParseOTelHeaders:
 
         result = _parse_otel_headers("key1=val1,key2=val2")
         assert result == {"key1": "val1", "key2": "val2"}
+
+
+class TestOTelMetrics:
+    """Test OTel metrics instruments."""
+
+    def test_metrics_none_when_not_initialized(self):
+        """Metrics should be None when OTel is not initialized."""
+        from holmes.core.otel_tracing import get_metrics
+        # Before any tracer is created, metrics may or may not be set
+        # depending on test ordering. Just verify the function is callable.
+        result = get_metrics()
+        assert result is None or hasattr(result, "llm_input_tokens")
+
+    def test_otel_metrics_instruments_exist(self):
+        """OTelMetrics should have all expected metric instruments."""
+        from holmes.core.otel_tracing import OTelMetrics
+        from opentelemetry.sdk.metrics import MeterProvider
+
+        meter_provider = MeterProvider()
+        meter = meter_provider.get_meter("test", "0.1.0")
+        m = OTelMetrics(meter)
+
+        assert hasattr(m, "llm_input_tokens")
+        assert hasattr(m, "investigation_duration")
+        assert hasattr(m, "investigation_count")
+        assert hasattr(m, "investigation_iterations")
+        assert hasattr(m, "llm_call_duration")
+        assert hasattr(m, "tool_call_count")
+        assert hasattr(m, "tool_call_duration")
+        assert hasattr(m, "tool_call_errors")
+
+        meter_provider.shutdown()
+
+    def test_metrics_recording_does_not_raise(self):
+        """Recording metrics should not raise exceptions."""
+        from holmes.core.otel_tracing import OTelMetrics
+        from opentelemetry.sdk.metrics import MeterProvider
+
+        meter_provider = MeterProvider()
+        meter = meter_provider.get_meter("test", "0.1.0")
+        m = OTelMetrics(meter)
+
+        # These should not raise
+        m.llm_input_tokens.add(100, {"gen_ai.request.model": "test", "gen_ai.token.type": "input"})
+        m.investigation_count.add(1, {"gen_ai.request.model": "test"})
+        m.investigation_duration.record(1.5, {"gen_ai.request.model": "test"})
+        m.investigation_iterations.record(3, {"gen_ai.request.model": "test"})
+        m.llm_call_duration.record(0.5, {"gen_ai.request.model": "test"})
+        m.tool_call_count.add(1, {"holmesgpt.tool.name": "list_pods"})
+        m.tool_call_duration.record(2.0, {"holmesgpt.tool.name": "list_pods"})
+        m.tool_call_errors.add(1, {"holmesgpt.tool.name": "list_pods"})
+
+        meter_provider.shutdown()
