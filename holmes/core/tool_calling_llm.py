@@ -1,3 +1,4 @@
+import contextvars
 import concurrent.futures
 import json
 import logging
@@ -581,7 +582,9 @@ class ToolCallingLLM:
                     logging.debug(f"Tool to call: {t}")
                     tool_number = tool_number_offset + tool_index
 
+                    ctx = contextvars.copy_context()
                     future = executor.submit(
+                        ctx.run,
                         self._invoke_llm_tool_call,
                         tool_to_call=t,
                         previous_tool_calls=tool_calls,
@@ -1141,7 +1144,9 @@ class ToolCallingLLM:
                 for tool_index, t in enumerate(tools_to_call, 1):  # type: ignore
                     tool_number = tool_number_offset + tool_index
 
+                    ctx = contextvars.copy_context()
                     future = executor.submit(
+                        ctx.run,
                         self._invoke_llm_tool_call,
                         tool_to_call=t,  # type: ignore
                         previous_tool_calls=tool_calls,
