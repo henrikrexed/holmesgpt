@@ -6,9 +6,9 @@ from typing import Any, Dict, Optional
 from holmes.core.tracing import DummySpan, SpanType
 
 try:
+    from opentelemetry import context as otel_context
     from opentelemetry import trace
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    from opentelemetry.propagate import inject
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -31,21 +31,35 @@ GEN_AI_USAGE_TOTAL_TOKENS = "gen_ai.usage.total_tokens"
 
 
 class OTelSpan:
-    """Wraps an OTel span to match Holmes' span interface."""
+    """Wraps an OTel span to match Holmes' span interface.
 
-    def __init__(self, otel_span: Any, tracer: Any, context: Any = None):
+    Key design: every OTelSpan **activates** its underlying span in the
+    current OTel context so that auto-instrumented libraries (httpx, etc.)
+    automatically create child spans under it.
+    """
+
+    def __init__(self, otel_span: Any, tracer: Any, token: Any = None):
         self._span = otel_span
         self._tracer = tracer
-        self._context = context
+        # Token from context.attach() — needed to detach on end/exit
+        self._token = token
 
     def start_span(self, name: Optional[str] = None, span_type: Optional[SpanType] = None, **kwargs) -> "OTelSpan":
-        """Create a child span."""
+        """Create a child span and activate it in the current context."""
         span_name = name or kwargs.get("type", "unknown")
-        if span_type:
-            span_name = f"{span_name}" if name else span_type.value
+        if span_type and not name:
+            span_name = span_type.value
+
+        # Parent context is the current context (which has self._span active)
         ctx = trace.set_span_in_context(self._span)
         new_span = self._tracer.start_span(span_name, context=ctx)
-        return OTelSpan(new_span, self._tracer, ctx)
+
+        # Activate the child span so httpx/other auto-instrumented calls
+        # made while this span is alive become its children
+        new_ctx = trace.set_span_in_context(new_span)
+        token = otel_context.attach(new_ctx)
+
+        return OTelSpan(new_span, self._tracer, token)
 
     def log(self, *args: Any, **kwargs: Any) -> None:
         """Log attributes to the span."""
@@ -63,6 +77,10 @@ class OTelSpan:
                     self._span.set_attribute(k, str(v))
 
     def end(self) -> None:
+        """End the span and detach from context."""
+        if self._token is not None:
+            otel_context.detach(self._token)
+            self._token = None
         self._span.end()
 
     def set_attributes(self, name: Optional[str] = None, type: Optional[str] = None, span_attributes: Optional[Dict[str, Any]] = None) -> None:
@@ -81,6 +99,9 @@ class OTelSpan:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if exc_type and OTEL_AVAILABLE:
             self._span.set_status(StatusCode.ERROR, str(exc_val))
+        if self._token is not None:
+            otel_context.detach(self._token)
+            self._token = None
         self._span.end()
 
 
@@ -108,11 +129,14 @@ class OpenTelemetryTracer:
         )
         provider.add_span_processor(BatchSpanProcessor(exporter))
 
+        # Set global provider BEFORE instrumenting httpx so the instrumentor
+        # picks up the same provider and traces link correctly
         trace.set_tracer_provider(provider)
         self._tracer = trace.get_tracer("holmesgpt", "0.1.0")
         self._provider = provider
 
-        # Auto-instrument httpx for MCP trace context propagation
+        # Auto-instrument httpx for MCP trace context propagation.
+        # Must happen AFTER set_tracer_provider so httpx spans use our provider.
         try:
             from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
@@ -127,8 +151,16 @@ class OpenTelemetryTracer:
         return None
 
     def start_trace(self, name: str, span_type: Optional[SpanType] = None) -> OTelSpan:
+        """Start a root trace span and activate it in the current context.
+
+        The span is attached to the OTel context so that any auto-instrumented
+        calls (httpx, etc.) made while this span is alive become its children.
+        """
         span = self._tracer.start_span(name)
-        return OTelSpan(span, self._tracer)
+        # Activate the root span in context
+        ctx = trace.set_span_in_context(span)
+        token = otel_context.attach(ctx)
+        return OTelSpan(span, self._tracer, token)
 
     def get_trace_url(self) -> Optional[str]:
         return None

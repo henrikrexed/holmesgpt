@@ -461,6 +461,10 @@ class ToolCallingLLM:
 
             logging.debug(f"sending messages={messages}\n\ntools={tools}")
 
+            # Create a child gen_ai.chat span for each LLM call iteration.
+            # The span is activated in context so httpx calls during completion()
+            # (e.g. LiteLLM HTTP calls) become children of this gen_ai.chat span.
+            llm_span = trace_span.start_span(name="gen_ai.chat")
             try:
                 full_response = self.llm.completion(
                     messages=parse_messages_tags(messages),
@@ -475,8 +479,8 @@ class ToolCallingLLM:
                 # Extract and accumulate cost information
                 _process_cost_info(full_response, costs, "LLM call")
 
-                # Enrich trace span with GenAI semantic convention attributes
-                trace_span.log(metadata={
+                # Log GenAI semantic convention attributes on the LLM child span
+                llm_span.log(metadata={
                     "gen_ai.system": "litellm",
                     "gen_ai.request.model": self.llm.model,
                     "gen_ai.usage.input_tokens": costs.prompt_tokens,
@@ -506,6 +510,10 @@ class ToolCallingLLM:
                     exc_info=True,
                 )
                 raise
+            finally:
+                # End the gen_ai.chat span (and detach from context) so that
+                # subsequent tool call spans become siblings, not children
+                llm_span.end()
 
             if cancel_event and cancel_event.is_set():
                 raise LLMInterruptedError()

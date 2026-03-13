@@ -3,40 +3,69 @@ import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from holmes.core.tracing import DummySpan, DummyTracer, SpanType, TracingFactory
+
+
+@pytest.fixture()
+def in_memory_exporter():
+    """Set up an in-memory OTel provider for testing span hierarchy.
+
+    Uses _TRACER_PROVIDER_SET_ONCE to allow resetting the global provider
+    between tests, since OTel SDK normally prevents overriding.
+    """
+    exporter = InMemorySpanExporter()
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    # Reset the global provider guard so we can set a fresh provider per test
+    trace._TRACER_PROVIDER_SET_ONCE._done = False  # type: ignore[attr-defined]
+    trace.set_tracer_provider(provider)
+
+    yield exporter
+    provider.shutdown()
 
 
 class TestOTelSpan:
     """Test OTelSpan wrapper behavior."""
 
-    def test_otel_span_context_manager(self):
+    def test_otel_span_context_manager(self, in_memory_exporter):
         """OTelSpan works as a context manager and ends the underlying span."""
         from holmes.core.otel_tracing import OTelSpan
 
-        mock_span = MagicMock()
-        mock_tracer = MagicMock()
-        otel_span = OTelSpan(mock_span, mock_tracer)
+        tracer = trace.get_tracer("test")
+        raw_span = tracer.start_span("test")
+        otel_span = OTelSpan(raw_span, tracer)
 
         with otel_span:
             pass
 
-        mock_span.end.assert_called_once()
+        spans = in_memory_exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].name == "test"
 
-    def test_otel_span_context_manager_on_error(self):
+    def test_otel_span_context_manager_on_error(self, in_memory_exporter):
         """OTelSpan sets error status on exception."""
+        from opentelemetry.trace import StatusCode
+
         from holmes.core.otel_tracing import OTelSpan
 
-        mock_span = MagicMock()
-        mock_tracer = MagicMock()
-        otel_span = OTelSpan(mock_span, mock_tracer)
+        tracer = trace.get_tracer("test")
+        raw_span = tracer.start_span("test")
+        otel_span = OTelSpan(raw_span, tracer)
 
         with pytest.raises(ValueError):
             with otel_span:
                 raise ValueError("test error")
 
-        mock_span.set_status.assert_called_once()
-        mock_span.end.assert_called_once()
+        spans = in_memory_exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].status.status_code == StatusCode.ERROR
 
     def test_otel_span_log_metadata(self):
         """OTelSpan.log() sets attributes on the underlying span."""
@@ -66,21 +95,6 @@ class TestOTelSpan:
         for call in calls:
             assert len(call[0][1]) <= 4096
 
-    def test_otel_span_start_child_span(self):
-        """OTelSpan.start_span() creates a child span via the tracer."""
-        from holmes.core.otel_tracing import OTelSpan
-
-        mock_span = MagicMock()
-        mock_tracer = MagicMock()
-        child_mock = MagicMock()
-        mock_tracer.start_span.return_value = child_mock
-
-        otel_span = OTelSpan(mock_span, mock_tracer)
-        child = otel_span.start_span(name="child_span")
-
-        mock_tracer.start_span.assert_called_once()
-        assert child._span == child_mock
-
     def test_otel_span_set_attributes(self):
         """OTelSpan.set_attributes() updates span name and attributes."""
         from holmes.core.otel_tracing import OTelSpan
@@ -98,6 +112,112 @@ class TestOTelSpan:
         mock_span.set_attribute.assert_called_once_with("attr1", "val1")
 
 
+class TestSpanHierarchy:
+    """Test that spans form correct parent-child relationships."""
+
+    def test_child_spans_have_correct_parent(self, in_memory_exporter):
+        """start_span() creates children linked to the parent span."""
+        from holmes.core.otel_tracing import OTelSpan
+
+        tracer = trace.get_tracer("test")
+        raw_root = tracer.start_span("root")
+        root = OTelSpan(raw_root, tracer)
+
+        child = root.start_span(name="child")
+        child.end()
+        root.end()
+
+        spans = in_memory_exporter.get_finished_spans()
+        assert len(spans) == 2
+
+        child_span = next(s for s in spans if s.name == "child")
+        root_span = next(s for s in spans if s.name == "root")
+        assert child_span.parent.span_id == root_span.context.span_id
+
+    def test_context_activation_makes_auto_spans_children(self, in_memory_exporter):
+        """Activated spans become the parent for spans created via the global tracer.
+
+        This simulates what httpx auto-instrumentation does: it creates spans
+        using trace.get_tracer().start_span() which picks up the current context.
+        """
+        from holmes.core.otel_tracing import OTelSpan
+
+        tracer = trace.get_tracer("test")
+
+        # Create and activate a root span (simulates start_trace)
+        raw_root = tracer.start_span("investigation")
+        from opentelemetry import context as otel_context
+
+        ctx = trace.set_span_in_context(raw_root)
+        token = otel_context.attach(ctx)
+        root = OTelSpan(raw_root, tracer, token)
+
+        # Create a child (simulates gen_ai.chat)
+        chat_span = root.start_span(name="gen_ai.chat")
+
+        # Simulate an auto-instrumented httpx call: it uses the current context
+        with tracer.start_as_current_span("HTTP POST"):
+            pass  # auto-instrumented span ends here
+
+        chat_span.end()
+
+        # Create another child (simulates tool span)
+        tool_span = root.start_span(name="holmesgpt.tool.kubectl")
+
+        # Another auto-instrumented call during tool execution
+        with tracer.start_as_current_span("HTTP POST /mcp"):
+            pass
+
+        tool_span.end()
+        root.end()
+
+        spans = in_memory_exporter.get_finished_spans()
+        assert len(spans) == 5
+
+        by_name = {s.name: s for s in spans}
+
+        # gen_ai.chat is child of investigation
+        assert by_name["gen_ai.chat"].parent.span_id == by_name["investigation"].context.span_id
+
+        # HTTP POST is child of gen_ai.chat (because chat_span was active in context)
+        assert by_name["HTTP POST"].parent.span_id == by_name["gen_ai.chat"].context.span_id
+
+        # holmesgpt.tool.kubectl is child of investigation
+        assert by_name["holmesgpt.tool.kubectl"].parent.span_id == by_name["investigation"].context.span_id
+
+        # HTTP POST /mcp is child of tool span
+        assert by_name["HTTP POST /mcp"].parent.span_id == by_name["holmesgpt.tool.kubectl"].context.span_id
+
+    def test_end_detaches_context(self, in_memory_exporter):
+        """After end(), the span is no longer the active parent."""
+        from holmes.core.otel_tracing import OTelSpan
+
+        tracer = trace.get_tracer("test")
+
+        # Root span
+        raw_root = tracer.start_span("root")
+        from opentelemetry import context as otel_context
+
+        ctx = trace.set_span_in_context(raw_root)
+        token = otel_context.attach(ctx)
+        root = OTelSpan(raw_root, tracer, token)
+
+        # Child span — activated in context
+        child = root.start_span(name="child")
+        child.end()  # Should detach — context returns to root
+
+        # New span created after child.end() should be child of root, not child
+        sibling = root.start_span(name="sibling")
+        sibling.end()
+        root.end()
+
+        spans = in_memory_exporter.get_finished_spans()
+        by_name = {s.name: s for s in spans}
+
+        assert by_name["child"].parent.span_id == by_name["root"].context.span_id
+        assert by_name["sibling"].parent.span_id == by_name["root"].context.span_id
+
+
 class TestOpenTelemetryTracer:
     """Test OpenTelemetryTracer initialization and behavior."""
 
@@ -109,6 +229,22 @@ class TestOpenTelemetryTracer:
             tracer = OpenTelemetryTracer(service_name="test")
             span = tracer.start_trace("test_trace")
             assert isinstance(span, OTelSpan)
+            assert span._token is not None  # Span is activated in context
+            span.end()
+            tracer.shutdown()
+
+    def test_tracer_start_trace_activates_context(self):
+        """start_trace() activates the span so it's visible as current span."""
+        from holmes.core.otel_tracing import OpenTelemetryTracer
+
+        with patch.dict(os.environ, {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317"}):
+            tracer = OpenTelemetryTracer(service_name="test")
+            span = tracer.start_trace("test_trace")
+
+            # The current span in context should be our span
+            current = trace.get_current_span()
+            assert current == span._span
+
             span.end()
             tracer.shutdown()
 
