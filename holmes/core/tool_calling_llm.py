@@ -497,11 +497,11 @@ class ToolCallingLLM:
                 otel_metrics = get_metrics()
                 if otel_metrics:
                     raw = extract_usage_from_response(full_response)
-                    model_attrs = {"gen_ai.request.model": self.llm.model, "gen_ai.system": "litellm"}
+                    model_attrs = {"gen_ai_request_model": self.llm.model, "gen_ai_system": "litellm"}
                     if raw.prompt_tokens > 0:
-                        otel_metrics.llm_input_tokens.add(raw.prompt_tokens, {**model_attrs, "gen_ai.token.type": "input"})
+                        otel_metrics.llm_input_tokens.add(raw.prompt_tokens, {**model_attrs, "gen_ai_token_type": "input"})
                     if raw.completion_tokens > 0:
-                        otel_metrics.llm_input_tokens.add(raw.completion_tokens, {**model_attrs, "gen_ai.token.type": "output"})
+                        otel_metrics.llm_input_tokens.add(raw.completion_tokens, {**model_attrs, "gen_ai_token_type": "output"})
                     llm_duration = time.time() - _llm_call_start
                     otel_metrics.llm_call_duration.record(llm_duration, model_attrs)
                     logging.info(f"OTel metric recorded: tokens input={raw.prompt_tokens} output={raw.completion_tokens}, llm_duration={llm_duration:.3f}s, attrs={model_attrs}")
@@ -890,7 +890,7 @@ class ToolCallingLLM:
             # Record tool call metrics
             otel_metrics = get_metrics()
             if otel_metrics:
-                tool_attrs = {"holmesgpt.tool.name": tool_call_result.tool_name}
+                tool_attrs = {"holmesgpt_tool_name": tool_call_result.tool_name}
                 otel_metrics.tool_call_count.add(1, tool_attrs)
                 otel_metrics.tool_call_duration.record(time.time() - _tool_start, tool_attrs)
                 logging.info(f"OTel metric recorded: tool.call.count=1, tool.call.duration={time.time() - _tool_start:.3f}s, attrs={tool_attrs}")
@@ -1096,11 +1096,11 @@ class ToolCallingLLM:
                 otel_metrics = get_metrics()
                 if otel_metrics:
                     raw = extract_usage_from_response(full_response)
-                    model_attrs = {"gen_ai.request.model": self.llm.model, "gen_ai.system": "litellm"}
+                    model_attrs = {"gen_ai_request_model": self.llm.model, "gen_ai_system": "litellm"}
                     if raw.prompt_tokens > 0:
-                        otel_metrics.llm_input_tokens.add(raw.prompt_tokens, {**model_attrs, "gen_ai.token.type": "input"})
+                        otel_metrics.llm_input_tokens.add(raw.prompt_tokens, {**model_attrs, "gen_ai_token_type": "input"})
                     if raw.completion_tokens > 0:
-                        otel_metrics.llm_input_tokens.add(raw.completion_tokens, {**model_attrs, "gen_ai.token.type": "output"})
+                        otel_metrics.llm_input_tokens.add(raw.completion_tokens, {**model_attrs, "gen_ai_token_type": "output"})
                     otel_metrics.llm_call_duration.record(time.time() - _llm_call_start, model_attrs)
 
                 # Log GenAI attributes on the LLM child span

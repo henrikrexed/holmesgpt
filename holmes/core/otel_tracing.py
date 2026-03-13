@@ -26,8 +26,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # OTel GenAI semantic convention attribute names
-GEN_AI_SYSTEM = "gen_ai.system"
-GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
+GEN_AI_SYSTEM = "gen_ai_system"
+GEN_AI_REQUEST_MODEL = "gen_ai_request_model"
 GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
 GEN_AI_REQUEST_TEMPERATURE = "gen_ai.request.temperature"
 GEN_AI_USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
@@ -226,35 +226,35 @@ class OpenTelemetryTracer:
         views = [
             View(
                 instrument_name="holmesgpt.tool.call.count",
-                attribute_keys=["holmesgpt.tool.name"],
+                attribute_keys=["holmesgpt_tool_name"],
             ),
             View(
                 instrument_name="holmesgpt.tool.call.duration",
-                attribute_keys=["holmesgpt.tool.name"],
+                attribute_keys=["holmesgpt_tool_name"],
             ),
             View(
                 instrument_name="holmesgpt.tool.call.errors",
-                attribute_keys=["holmesgpt.tool.name"],
+                attribute_keys=["holmesgpt_tool_name"],
             ),
             View(
                 instrument_name="gen_ai.client.token.usage",
-                attribute_keys=["gen_ai.request.model", "gen_ai.system", "gen_ai.token.type"],
+                attribute_keys=["gen_ai_request_model", "gen_ai_system", "gen_ai_token_type"],
             ),
             View(
                 instrument_name="gen_ai.client.operation.duration",
-                attribute_keys=["gen_ai.request.model", "gen_ai.system"],
+                attribute_keys=["gen_ai_request_model", "gen_ai_system"],
             ),
             View(
                 instrument_name="holmesgpt.investigation.count",
-                attribute_keys=["gen_ai.request.model"],
+                attribute_keys=["gen_ai_request_model"],
             ),
             View(
                 instrument_name="holmesgpt.investigation.duration",
-                attribute_keys=["gen_ai.request.model"],
+                attribute_keys=["gen_ai_request_model"],
             ),
             View(
                 instrument_name="holmesgpt.investigation.iterations",
-                attribute_keys=["gen_ai.request.model"],
+                attribute_keys=["gen_ai_request_model"],
             ),
         ]
         meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader], views=views)

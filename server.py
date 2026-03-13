@@ -410,7 +410,7 @@ def chat(chat_request: ChatRequest, http_request: Request):
             })
             otel_metrics = get_metrics()
             if otel_metrics:
-                inv_attrs = {"gen_ai.request.model": chat_request.model or config.model or "unknown"}
+                inv_attrs = {"gen_ai_request_model": chat_request.model or config.model or "unknown"}
                 otel_metrics.investigation_count.add(1, inv_attrs)
 
             stream = stream_chat_formatter(
@@ -451,7 +451,7 @@ def chat(chat_request: ChatRequest, http_request: Request):
                 # Record investigation metrics
                 otel_metrics = get_metrics()
                 if otel_metrics:
-                    inv_attrs = {"gen_ai.request.model": chat_request.model or config.model or "unknown"}
+                    inv_attrs = {"gen_ai_request_model": chat_request.model or config.model or "unknown"}
                     otel_metrics.investigation_count.add(1, inv_attrs)
                     otel_metrics.investigation_duration.record(time.time() - _inv_start, inv_attrs)
                     if hasattr(llm_call, "num_llm_calls") and llm_call.num_llm_calls:

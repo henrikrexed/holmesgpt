@@ -363,13 +363,13 @@ class TestOTelMetrics:
         m = OTelMetrics(meter)
 
         # These should not raise
-        m.llm_input_tokens.add(100, {"gen_ai.request.model": "test", "gen_ai.token.type": "input"})
-        m.investigation_count.add(1, {"gen_ai.request.model": "test"})
-        m.investigation_duration.record(1.5, {"gen_ai.request.model": "test"})
-        m.investigation_iterations.record(3, {"gen_ai.request.model": "test"})
-        m.llm_call_duration.record(0.5, {"gen_ai.request.model": "test"})
-        m.tool_call_count.add(1, {"holmesgpt.tool.name": "list_pods"})
-        m.tool_call_duration.record(2.0, {"holmesgpt.tool.name": "list_pods"})
-        m.tool_call_errors.add(1, {"holmesgpt.tool.name": "list_pods"})
+        m.llm_input_tokens.add(100, {"gen_ai_request_model": "test", "gen_ai_token_type": "input"})
+        m.investigation_count.add(1, {"gen_ai_request_model": "test"})
+        m.investigation_duration.record(1.5, {"gen_ai_request_model": "test"})
+        m.investigation_iterations.record(3, {"gen_ai_request_model": "test"})
+        m.llm_call_duration.record(0.5, {"gen_ai_request_model": "test"})
+        m.tool_call_count.add(1, {"holmesgpt_tool_name": "list_pods"})
+        m.tool_call_duration.record(2.0, {"holmesgpt_tool_name": "list_pods"})
+        m.tool_call_errors.add(1, {"holmesgpt_tool_name": "list_pods"})
 
         meter_provider.shutdown()
