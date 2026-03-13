@@ -504,6 +504,7 @@ class ToolCallingLLM:
                         otel_metrics.llm_input_tokens.add(raw.completion_tokens, {**model_attrs, "gen_ai.token.type": "output"})
                     llm_duration = time.time() - _llm_call_start
                     otel_metrics.llm_call_duration.record(llm_duration, model_attrs)
+                    logging.info(f"OTel metric recorded: tokens input={raw.prompt_tokens} output={raw.completion_tokens}, llm_duration={llm_duration:.3f}s, attrs={model_attrs}")
 
                 # Log GenAI semantic convention attributes on the LLM child span
                 llm_span.log(metadata={
@@ -892,6 +893,7 @@ class ToolCallingLLM:
                 tool_attrs = {"holmesgpt.tool.name": tool_call_result.tool_name}
                 otel_metrics.tool_call_count.add(1, tool_attrs)
                 otel_metrics.tool_call_duration.record(time.time() - _tool_start, tool_attrs)
+                logging.info(f"OTel metric recorded: tool.call.count=1, tool.call.duration={time.time() - _tool_start:.3f}s, attrs={tool_attrs}")
                 if tool_call_result.result.status and tool_call_result.result.status.value == "error":
                     otel_metrics.tool_call_errors.add(1, tool_attrs)
 

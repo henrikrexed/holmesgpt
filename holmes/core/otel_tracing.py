@@ -212,8 +212,10 @@ class OpenTelemetryTracer:
         self._provider = trace_provider
 
         # --- Metrics ---
+        metrics_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", endpoint)
+        logger.info("OTel metrics exporter endpoint: %s (traces: %s)", metrics_endpoint, endpoint)
         metric_exporter = OTLPMetricExporter(
-            endpoint=endpoint,
+            endpoint=metrics_endpoint,
             insecure=insecure,
             headers=headers or None,
         )
@@ -260,6 +262,7 @@ class OpenTelemetryTracer:
         self._meter_provider = meter_provider
         meter = metrics.get_meter("holmesgpt", "0.1.0")
         _metrics = OTelMetrics(meter)
+        logger.info("OTel metrics initialized with %d views, export interval=30s", len(views))
 
         # Auto-instrument httpx for MCP trace context propagation.
         # Must happen AFTER set_tracer_provider so httpx spans use our provider.
