@@ -288,6 +288,17 @@ class TracingFactory:
             Tracer instance if tracing enabled, DummySpan if disabled
         """
         if not trace_type:
+            # Auto-detect: enable OTel if endpoint is configured
+            if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+                try:
+                    from holmes.core.otel_tracing import OpenTelemetryTracer
+
+                    service_name = os.environ.get("OTEL_SERVICE_NAME", "holmesgpt")
+                    return OpenTelemetryTracer(service_name=service_name)
+                except ImportError:
+                    logging.debug(
+                        "OTEL_EXPORTER_OTLP_ENDPOINT set but otel packages not installed, using DummyTracer"
+                    )
             return DummyTracer()
 
         if trace_type.lower() == "braintrust":
@@ -304,6 +315,18 @@ class TracingFactory:
                 return DummyTracer()
 
             return BraintrustTracer(project=project)
+
+        if trace_type.lower() == "otel":
+            try:
+                from holmes.core.otel_tracing import OpenTelemetryTracer
+
+                service_name = os.environ.get("OTEL_SERVICE_NAME", "holmesgpt")
+                return OpenTelemetryTracer(service_name=service_name)
+            except ImportError:
+                logging.warning(
+                    "OpenTelemetry tracing requested but otel packages not installed"
+                )
+                return DummyTracer()
 
         logging.warning(f"Unknown trace type: {trace_type}")
         return DummyTracer()

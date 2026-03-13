@@ -133,6 +133,7 @@ nav:
           - "Runbooks": reference/runbooks.md
           - "Slash Commands": reference/slash-commands.md
           - "Troubleshooting": reference/troubleshooting.md
+          - "OpenTelemetry": reference/opentelemetry.md
     - Community: community.md
 
 theme:
