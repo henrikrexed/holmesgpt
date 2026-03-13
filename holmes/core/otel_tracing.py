@@ -78,10 +78,21 @@ class OTelSpan:
 
     def end(self) -> None:
         """End the span and detach from context."""
-        if self._token is not None:
-            otel_context.detach(self._token)
-            self._token = None
+        self._safe_detach()
         self._span.end()
+
+    def _safe_detach(self) -> None:
+        """Detach context token, tolerating cross-context calls (generators/threads)."""
+        if self._token is not None:
+            try:
+                otel_context.detach(self._token)
+            except ValueError:
+                # Token created in a different context (e.g., streaming generator
+                # yielding across thread/coroutine boundaries). This is expected
+                # for long-lived spans that wrap generators. The span still exports
+                # correctly; we just can't restore the previous context.
+                logger.debug("Context detach skipped (cross-context span lifecycle)")
+            self._token = None
 
     def set_attributes(self, name: Optional[str] = None, type: Optional[str] = None, span_attributes: Optional[Dict[str, Any]] = None) -> None:
         if name:
@@ -99,9 +110,7 @@ class OTelSpan:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if exc_type and OTEL_AVAILABLE:
             self._span.set_status(StatusCode.ERROR, str(exc_val))
-        if self._token is not None:
-            otel_context.detach(self._token)
-            self._token = None
+        self._safe_detach()
         self._span.end()
 
 
