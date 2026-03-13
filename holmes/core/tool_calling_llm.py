@@ -41,6 +41,7 @@ from holmes.core.tools_utils.tool_context_window_limiter import (
 )
 from holmes.core.tools_utils.tool_executor import ToolExecutor
 from holmes.core.tracing import DummySpan
+from holmes.core.otel_tracing import get_metrics
 from holmes.core.truncation.input_context_window_limiter import (
     limit_input_context_window,
 )
