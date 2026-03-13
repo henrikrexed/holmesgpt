@@ -315,6 +315,21 @@ def _stream_with_storage_cleanup(storage, stream_generator, req_info):
         storage.__exit__(None, None, None)
 
 
+def _stream_with_trace_cleanup(storage, stream_generator, req_info, trace_span):
+    """Wrap a stream generator with both storage cleanup and OTel span lifecycle.
+
+    The investigation span stays active throughout all yields so that httpx
+    auto-instrumented calls made during streaming become children of it.
+    The span is ended in the finally block so it always closes, even on error.
+    """
+    try:
+        yield from stream_generator
+    finally:
+        logging.info(f"Stream request end: {req_info}")
+        trace_span.end()
+        storage.__exit__(None, None, None)
+
+
 @app.post("/api/chat")
 def chat(chat_request: ChatRequest, http_request: Request):
     try:
@@ -386,6 +401,13 @@ def chat(chat_request: ChatRequest, http_request: Request):
         )
 
         if chat_request.stream:
+            # Create root investigation span for streaming (same as non-streaming)
+            trace_span = server_tracer.start_trace("holmesgpt.investigation")
+            trace_span.log(metadata={
+                "holmesgpt.investigation.question": chat_request.ask[:1024],
+                "holmesgpt.investigation.stream": True,
+            })
+
             stream = stream_chat_formatter(
                 ai.call_stream(
                     msgs=messages,
@@ -393,11 +415,12 @@ def chat(chat_request: ChatRequest, http_request: Request):
                     tool_decisions=chat_request.tool_decisions,
                     response_format=chat_request.response_format,
                     request_context=request_context,
+                    trace_span=trace_span,
                 ),
                 [f.model_dump() for f in follow_up_actions],
             )
             return StreamingResponse(
-                _stream_with_storage_cleanup(storage, stream, req_info),
+                _stream_with_trace_cleanup(storage, stream, req_info, trace_span),
                 media_type="text/event-stream",
             )
         else:
