@@ -16,6 +16,7 @@ try:
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.sdk.metrics.view import View
     from opentelemetry.trace import StatusCode
 
     OTEL_AVAILABLE = True
@@ -219,7 +220,42 @@ class OpenTelemetryTracer:
         metric_reader = PeriodicExportingMetricReader(
             metric_exporter, export_interval_millis=30000
         )
-        meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+        # Define views to ensure attribute keys are preserved as dimensions
+        views = [
+            View(
+                instrument_name="holmesgpt.tool.call.count",
+                attribute_keys=["holmesgpt.tool.name"],
+            ),
+            View(
+                instrument_name="holmesgpt.tool.call.duration",
+                attribute_keys=["holmesgpt.tool.name"],
+            ),
+            View(
+                instrument_name="holmesgpt.tool.call.errors",
+                attribute_keys=["holmesgpt.tool.name"],
+            ),
+            View(
+                instrument_name="gen_ai.client.token.usage",
+                attribute_keys=["gen_ai.request.model", "gen_ai.system", "gen_ai.token.type"],
+            ),
+            View(
+                instrument_name="gen_ai.client.operation.duration",
+                attribute_keys=["gen_ai.request.model", "gen_ai.system"],
+            ),
+            View(
+                instrument_name="holmesgpt.investigation.count",
+                attribute_keys=["gen_ai.request.model"],
+            ),
+            View(
+                instrument_name="holmesgpt.investigation.duration",
+                attribute_keys=["gen_ai.request.model"],
+            ),
+            View(
+                instrument_name="holmesgpt.investigation.iterations",
+                attribute_keys=["gen_ai.request.model"],
+            ),
+        ]
+        meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader], views=views)
         metrics.set_meter_provider(meter_provider)
         self._meter_provider = meter_provider
         meter = metrics.get_meter("holmesgpt", "0.1.0")
