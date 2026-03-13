@@ -1,0 +1,79 @@
+name: Docker Build (Fork)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (default: branch name)'
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Determine tag
+      id: tag
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ]]; then
+          echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+        elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        else
+          echo "tag=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Update package version
+      run: |
+        TAG=${{ steps.tag.outputs.tag }}
+        sed -i "s/__version__ = .*/__version__ = \"$TAG\"/g" holmes/__init__.py
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push Holmes
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: linux/arm64,linux/amd64
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository_owner }}/holmes:${{ steps.tag.outputs.tag }}
+          ghcr.io/${{ github.repository_owner }}/holmes:latest
+        build-args: |
+          BUILDKIT_INLINE_CACHE=1
+
+    - name: Build and push Holmes Operator
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile.operator
+        platforms: linux/arm64,linux/amd64
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository_owner }}/holmes-operator:${{ steps.tag.outputs.tag }}
+          ghcr.io/${{ github.repository_owner }}/holmes-operator:latest
+        build-args: |
+          BUILDKIT_INLINE_CACHE=1
+
+    - name: Save Helm chart artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: helm-chart
+        path: helm/holmes/
