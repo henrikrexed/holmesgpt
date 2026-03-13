@@ -56,6 +56,7 @@ from holmes.utils.holmes_sync_toolsets import holmes_sync_toolsets_status
 from holmes.utils.log import EndpointFilter
 from holmes.checks.checks_api import init_checks_app
 from holmes.core.tools_utils.filesystem_result_storage import tool_result_storage
+from holmes.core.tracing import TracingFactory
 from holmes.utils.stream import stream_chat_formatter
 
 # removed: add_runbooks_to_user_prompt
@@ -89,6 +90,9 @@ def init_logging():
 
 
 init_logging()
+
+# Initialize tracer — auto-detects OTel if OTEL_EXPORTER_OTLP_ENDPOINT is set
+server_tracer = TracingFactory.create_tracer(trace_type=os.environ.get("HOLMES_TRACE_BACKEND"))
 
 if ENABLE_CONNECTION_KEEPALIVE:
     patch_socket_create_connection()
@@ -366,7 +370,7 @@ def chat(chat_request: ChatRequest, http_request: Request):
         storage = tool_result_storage()
         tool_results_dir = storage.__enter__()
         ai = config.create_toolcalling_llm(
-            dal=dal, model=chat_request.model, tool_results_dir=tool_results_dir
+            dal=dal, model=chat_request.model, tracer=server_tracer, tool_results_dir=tool_results_dir
         )
         global_instructions = dal.get_global_instructions_for_account()
         messages = build_chat_messages(
@@ -398,21 +402,35 @@ def chat(chat_request: ChatRequest, http_request: Request):
             )
         else:
             try:
+                # Use provided trace_span or create a root investigation span
+                trace_span = chat_request.trace_span
+                if trace_span is None:
+                    trace_span = server_tracer.start_trace(
+                        "holmesgpt.investigation",
+                    )
+                    trace_span.log(metadata={
+                        "holmesgpt.investigation.question": chat_request.ask[:1024],
+                    })
+
                 llm_call = ai.messages_call(
                     messages=messages,
-                    trace_span=chat_request.trace_span,
+                    trace_span=trace_span,
                     response_format=chat_request.response_format,
                     request_context=request_context,
                 )
 
                 logging.info(f"Completed {req_info}")
-                return ChatResponse(
+                response = ChatResponse(
                     analysis=llm_call.result,
                     tool_calls=llm_call.tool_calls,
                     conversation_history=llm_call.messages,
                     follow_up_actions=follow_up_actions,
                     metadata=llm_call.metadata,
                 )
+                # End root investigation span if we created it
+                if chat_request.trace_span is None and trace_span is not None:
+                    trace_span.end()
+                return response
             finally:
                 storage.__exit__(None, None, None)
     except AuthenticationError as e:

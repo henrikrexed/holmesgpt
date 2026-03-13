@@ -475,6 +475,16 @@ class ToolCallingLLM:
                 # Extract and accumulate cost information
                 _process_cost_info(full_response, costs, "LLM call")
 
+                # Enrich trace span with GenAI semantic convention attributes
+                trace_span.log(metadata={
+                    "gen_ai.system": "litellm",
+                    "gen_ai.request.model": self.llm.model,
+                    "gen_ai.usage.input_tokens": costs.prompt_tokens,
+                    "gen_ai.usage.output_tokens": costs.completion_tokens,
+                    "gen_ai.usage.total_tokens": costs.total_tokens,
+                    "holmesgpt.iteration": i,
+                })
+
             # catch a known error that occurs with Azure and replace the error message with something more obvious to the user
             except BadRequestError as e:
                 if "Unrecognized request arguments supplied: tool_choice, tools" in str(
@@ -530,6 +540,13 @@ class ToolCallingLLM:
                     maximum_output_token=limit_result.maximum_output_token,
                     metadata=metadata,
                 )
+
+                # Final investigation summary on trace span
+                trace_span.log(metadata={
+                    "holmesgpt.investigation.num_turns": i,
+                    "holmesgpt.investigation.num_tools": len(all_tool_calls),
+                    "gen_ai.usage.total_tokens": costs.total_tokens,
+                })
 
                 return LLMResult(
                     result=text_response,
@@ -792,7 +809,9 @@ class ToolCallingLLM:
     ) -> ToolCallResult:
         if trace_span is None:
             trace_span = DummySpan()
-        with trace_span.start_span(type="tool") as tool_span:
+        # Extract tool name early for span naming
+        tool_name_for_span = getattr(getattr(tool_to_call, "function", None), "name", "unknown_tool")
+        with trace_span.start_span(name=f"holmesgpt.tool.{tool_name_for_span}", type="tool") as tool_span:
             if not hasattr(tool_to_call, "function"):
                 # Handle the union type - ChatCompletionMessageToolCall can be either
                 # ChatCompletionMessageFunctionToolCall (with 'function' field and type='function')
@@ -825,6 +844,10 @@ class ToolCallingLLM:
                     session_approved_prefixes=session_approved_prefixes,
                     request_context=request_context,
                 )
+            tool_span.log(metadata={
+                "holmesgpt.tool.name": tool_call_result.tool_name,
+                "holmesgpt.tool.status": tool_call_result.result.status.value if tool_call_result.result.status else "unknown",
+            })
 
             original_token_count = prevent_overly_big_tool_response(
                 tool_call_result=tool_call_result,

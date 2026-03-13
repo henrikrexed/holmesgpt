@@ -75,6 +75,15 @@ clickhouse-sqlalchemy = "^0.3.2"
 pymssql = "^2.3.0"
 pymongo = "^4.7.0"
 
+[tool.poetry.group.otel]
+optional = true
+
+[tool.poetry.group.otel.dependencies]
+opentelemetry-api = "^1.20.0"
+opentelemetry-sdk = "^1.20.0"
+opentelemetry-exporter-otlp-proto-grpc = "^1.20.0"
+opentelemetry-instrumentation-httpx = ">=0.41b0"
+
 [tool.poetry.group.dev]
 optional = true
 
