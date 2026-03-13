@@ -1,3 +1,4 @@
+import contextvars
 import concurrent.futures
 import json
 import logging
@@ -471,6 +472,10 @@ class ToolCallingLLM:
 
             logging.debug(f"sending messages={messages}\n\ntools={tools}")
 
+            # Create a child gen_ai.chat span for each LLM call iteration.
+            # The span is activated in context so httpx calls during completion()
+            # (e.g. LiteLLM HTTP calls) become children of this gen_ai.chat span.
+            llm_span = trace_span.start_span(name="gen_ai.chat")
             try:
                 full_response = self.llm.completion(
                     messages=parse_messages_tags(messages),
@@ -484,6 +489,16 @@ class ToolCallingLLM:
 
                 # Extract and accumulate cost information
                 _process_cost_info(full_response, costs, "LLM call")
+
+                # Log GenAI semantic convention attributes on the LLM child span
+                llm_span.log(metadata={
+                    "gen_ai.system": "litellm",
+                    "gen_ai.request.model": self.llm.model,
+                    "gen_ai.usage.input_tokens": costs.prompt_tokens,
+                    "gen_ai.usage.output_tokens": costs.completion_tokens,
+                    "gen_ai.usage.total_tokens": costs.total_tokens,
+                    "holmesgpt.iteration": i,
+                })
 
             # catch a known error that occurs with Azure and replace the error message with something more obvious to the user
             except BadRequestError as e:
@@ -506,6 +521,10 @@ class ToolCallingLLM:
                     exc_info=True,
                 )
                 raise
+            finally:
+                # End the gen_ai.chat span (and detach from context) so that
+                # subsequent tool call spans become siblings, not children
+                llm_span.end()
 
             if cancel_event and cancel_event.is_set():
                 raise LLMInterruptedError()
@@ -541,6 +560,13 @@ class ToolCallingLLM:
                     metadata=metadata,
                 )
 
+                # Final investigation summary on trace span
+                trace_span.log(metadata={
+                    "holmesgpt.investigation.num_turns": i,
+                    "holmesgpt.investigation.num_tools": len(all_tool_calls),
+                    "gen_ai.usage.total_tokens": costs.total_tokens,
+                })
+
                 return LLMResult(
                     result=text_response,
                     tool_calls=all_tool_calls,
@@ -566,7 +592,9 @@ class ToolCallingLLM:
                     logging.debug(f"Tool to call: {t}")
                     tool_number = tool_number_offset + tool_index
 
+                    ctx = contextvars.copy_context()
                     future = executor.submit(
+                        ctx.run,
                         self._invoke_llm_tool_call,
                         tool_to_call=t,
                         previous_tool_calls=tool_calls,
@@ -802,7 +830,9 @@ class ToolCallingLLM:
     ) -> ToolCallResult:
         if trace_span is None:
             trace_span = DummySpan()
-        with trace_span.start_span(type="tool") as tool_span:
+        # Extract tool name early for span naming
+        tool_name_for_span = getattr(getattr(tool_to_call, "function", None), "name", "unknown_tool")
+        with trace_span.start_span(name=f"holmesgpt.tool.{tool_name_for_span}", type="tool") as tool_span:
             if not hasattr(tool_to_call, "function"):
                 # Handle the union type - ChatCompletionMessageToolCall can be either
                 # ChatCompletionMessageFunctionToolCall (with 'function' field and type='function')
@@ -835,6 +865,10 @@ class ToolCallingLLM:
                     session_approved_prefixes=session_approved_prefixes,
                     request_context=request_context,
                 )
+            tool_span.log(metadata={
+                "holmesgpt.tool.name": tool_call_result.tool_name,
+                "holmesgpt.tool.status": tool_call_result.result.status.value if tool_call_result.result.status else "unknown",
+            })
 
             original_token_count = prevent_overly_big_tool_response(
                 tool_call_result=tool_call_result,
@@ -944,6 +978,7 @@ class ToolCallingLLM:
         enable_tool_approval: bool = False,
         tool_decisions: List[ToolApprovalDecision] | None = None,
         request_context: Optional[Dict[str, Any]] = None,
+        trace_span=DummySpan(),
     ):
         """
         This function DOES NOT call llm.completion(stream=true).
@@ -1013,6 +1048,8 @@ class ToolCallingLLM:
 
             logging.debug(f"sending messages={messages}\n\ntools={tools}")
 
+            # Create a child gen_ai.chat span for each LLM call iteration
+            llm_span = trace_span.start_span(name="gen_ai.chat")
             try:
                 full_response = self.llm.completion(
                     messages=parse_messages_tags(messages),  # type: ignore
@@ -1026,6 +1063,16 @@ class ToolCallingLLM:
 
                 # Accumulate cost information for this iteration
                 _process_cost_info(full_response, costs, log_prefix="LLM iteration")
+
+                # Log GenAI attributes on the LLM child span
+                llm_span.log(metadata={
+                    "gen_ai.system": "litellm",
+                    "gen_ai.request.model": self.llm.model,
+                    "gen_ai.usage.input_tokens": costs.prompt_tokens,
+                    "gen_ai.usage.output_tokens": costs.completion_tokens,
+                    "gen_ai.usage.total_tokens": costs.total_tokens,
+                    "holmesgpt.iteration": i,
+                })
 
             # catch a known error that occurs with Azure and replace the error message with something more obvious to the user
             except BadRequestError as e:
@@ -1048,6 +1095,9 @@ class ToolCallingLLM:
                     exc_info=True,
                 )
                 raise
+            finally:
+                # End gen_ai.chat span so tool spans become siblings, not children
+                llm_span.end()
 
             response_message = full_response.choices[0].message  # type: ignore
 
@@ -1070,6 +1120,12 @@ class ToolCallingLLM:
 
             tools_to_call = getattr(response_message, "tool_calls", None)
             if not tools_to_call:
+                # Log final investigation summary on the root trace span
+                trace_span.log(metadata={
+                    "holmesgpt.investigation.num_turns": i,
+                    "holmesgpt.investigation.num_tools": len(tool_calls),
+                    "gen_ai.usage.total_tokens": costs.total_tokens,
+                })
                 yield StreamMessage(
                     event=StreamEvents.ANSWER_END,
                     data={
@@ -1104,11 +1160,13 @@ class ToolCallingLLM:
                 for tool_index, t in enumerate(tools_to_call, 1):  # type: ignore
                     tool_number = tool_number_offset + tool_index
 
+                    ctx = contextvars.copy_context()
                     future = executor.submit(
+                        ctx.run,
                         self._invoke_llm_tool_call,
                         tool_to_call=t,  # type: ignore
                         previous_tool_calls=tool_calls,
-                        trace_span=DummySpan(),  # Streaming mode doesn't support tracing yet
+                        trace_span=trace_span,
                         tool_number=tool_number,
                         session_approved_prefixes=session_prefixes,
                         request_context=request_context,
