@@ -53,6 +53,7 @@ jobs:
         file: ./Dockerfile
         platforms: linux/arm64,linux/amd64
         push: true
+        no-cache: true
         tags: |
           ghcr.io/${{ github.repository_owner }}/holmes:${{ steps.tag.outputs.tag }}
           ghcr.io/${{ github.repository_owner }}/holmes:latest
