@@ -886,6 +886,9 @@ class ToolCallingLLM:
             if cancel_event and cancel_event.is_set():
                 raise LLMInterruptedError()
 
+            if cancel_event and cancel_event.is_set():
+                raise LLMInterruptedError()
+
             response_message = full_response.choices[0].message  # type: ignore
 
             messages.append(
