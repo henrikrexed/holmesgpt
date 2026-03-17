@@ -56,7 +56,7 @@ For complete setup instructions with `modelList` configuration, see the [Kuberne
 | response_format         | No       |         | object    | JSON schema for structured output (see below)   |
 | images                  | No       |         | array     | Image URLs, base64 data URIs, or objects with `url` (required), `detail` (low/high/auto), and `format` (MIME type). Requires vision-enabled model. See [Image Analysis](#image-analysis) |
 | stream                  | No       | false   | boolean   | Enable streaming response (SSE)                 |
-| enable_tool_approval    | No       | false   | boolean   | Require approval for certain tool executions    |
+| enable_tool_approval    | No       | false   | boolean   | Require approval for certain tool executions (see [Tool Approval Behavior](#tool-approval-behavior))    |
 | additional_system_prompt| No       |         | string    | Additional instructions appended to system prompt|
 | behavior_controls       | No       |         | object    | Override prompt sections to enable/disable them (see [Fast Mode & Prompt Controls](#fast-mode--prompt-controls)) |
 
@@ -288,6 +288,20 @@ For the most up-to-date list of vision-enabled models, see the [LiteLLM Vision D
 | url    | string | Image URL or base64 data URI (required)                |
 | detail | string | OpenAI-specific: `low`, `high`, or `auto` for resolution control |
 | format | string | MIME type (e.g., `image/jpeg`) for providers that need explicit format |
+
+#### Tool Approval Behavior
+
+The `enable_tool_approval` field controls how HolmesGPT handles tools that require approval (e.g., bash commands not in the allow list, or commands that bashlex cannot parse).
+
+**When `enable_tool_approval: true` (interactive clients):**
+
+The stream pauses and emits an `approval_required` event with the pending tool calls. The client must send a follow-up request with `tool_decisions` to approve or deny each tool call. See the [approval_required](#approval_required) event for details.
+
+**When `enable_tool_approval: false` (default, server/automation):**
+
+Tools that would require approval are automatically converted to errors. The error message is fed back to the LLM as a tool result, giving it a chance to self-correct and retry with a valid command. For example, if the LLM generates a bash command with unquoted special characters that can't be parsed, it receives an error and can retry with proper quoting.
+
+This means server-mode integrations (e.g., Keep workflows) do not need a human in the loop — the LLM handles recoverable validation failures automatically.
 
 ---
 
@@ -573,18 +587,58 @@ Emitted periodically to provide token usage updates during the chat. This event 
 
 ---
 
-#### `conversation_history_compacted`
+#### `conversation_history_compaction_start`
 
-Emitted when the conversation history has been compacted to fit within the context window. This happens automatically when the conversation grows too large.
+Emitted when the conversation history is about to be compacted. This event fires before the compaction LLM call, allowing clients to show a loading state.
 
 **Payload:**
 ```json
 {
-  "content": "Conversation history was compacted to fit within context limits.",
+  "content": "Compacting conversation history (150000 tokens, 42 messages)...",
+  "metadata": {
+    "initial_tokens": 150000,
+    "num_messages": 42,
+    "max_context_size": 128000,
+    "threshold_pct": 95
+  }
+}
+```
+
+**Fields:**
+
+- `content` (string): Human-readable status message
+- `metadata` (object): Context window state before compaction
+  - `initial_tokens` (integer): Current token count triggering compaction
+  - `num_messages` (integer): Number of messages in the conversation
+  - `max_context_size` (integer): Model's maximum context window size
+  - `threshold_pct` (integer): Context window usage percentage that triggered compaction
+
+---
+
+#### `conversation_history_compacted`
+
+Emitted when the conversation history has been compacted to fit within the context window. This happens automatically when the conversation grows too large. Contains detailed statistics about the compaction result.
+
+**Payload:**
+```json
+{
+  "content": "The conversation history has been compacted from 150000 to 80000 tokens",
+  "compaction_summary": "<analysis>\n1. Primary Request: User asked to investigate pod crashes...\n2. Key Technical Concepts: OOMKilled, memory limits...\n...\n</analysis>",
   "messages": [...],
   "metadata": {
     "initial_tokens": 150000,
-    "compacted_tokens": 80000
+    "compacted_tokens": 80000,
+    "compression_ratio_pct": 46.7,
+    "num_messages_before": 42,
+    "num_messages_after": 4,
+    "max_context_size": 128000,
+    "threshold_pct": 95,
+    "compaction_cost": {
+      "total_cost": 0.003542,
+      "prompt_tokens": 12000,
+      "completion_tokens": 800,
+      "total_tokens": 12800
+    }
   }
 }
 ```
@@ -592,10 +646,21 @@ Emitted when the conversation history has been compacted to fit within the conte
 **Fields:**
 
 - `content` (string): Human-readable description of the compaction
+- `compaction_summary` (string|null): The LLM-generated summary of the previous conversation history. This is the full text the model produced to condense the conversation, wrapped in `<analysis>` tags. Useful for debugging to verify that important context was preserved during compaction.
 - `messages` (array): The compacted conversation history
-- `metadata` (object): Token information about the compaction
+- `metadata` (object): Detailed compaction statistics
   - `initial_tokens` (integer): Token count before compaction
   - `compacted_tokens` (integer): Token count after compaction
+  - `compression_ratio_pct` (number): Percentage of tokens saved (e.g., 46.7 means 46.7% reduction)
+  - `num_messages_before` (integer): Number of messages before compaction
+  - `num_messages_after` (integer): Number of messages after compaction (typically 3-4)
+  - `max_context_size` (integer): Model's maximum context window size
+  - `threshold_pct` (integer): Context window usage percentage that triggered compaction
+  - `compaction_cost` (object, optional): Cost of the compaction LLM call
+    - `total_cost` (number): Dollar cost of the compaction call
+    - `prompt_tokens` (integer): Prompt tokens used for compaction
+    - `completion_tokens` (integer): Completion tokens generated during compaction
+    - `total_tokens` (integer): Total tokens used for compaction
 
 ---
 
@@ -646,9 +711,11 @@ Emitted when an error occurs during processing.
 ### Chat with History Compaction
 
 ```
-1. conversation_history_compacted
-2. start_tool_calling (tool 1)
-3. tool_calling_result (tool 1)
-4. token_count
-5. ai_answer_end
+1. conversation_history_compaction_start
+2. conversation_history_compacted
+3. ai_message (compaction notice)
+4. start_tool_calling (tool 1)
+5. tool_calling_result (tool 1)
+6. token_count
+7. ai_answer_end
 ```

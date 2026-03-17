@@ -441,7 +441,7 @@ def chat(chat_request: ChatRequest, http_request: Request):
                     })
 
                 _inv_start = time.time()
-                llm_call = ai.messages_call(
+                llm_call = ai.call(
                     messages=messages,
                     trace_span=trace_span,
                     response_format=chat_request.response_format,

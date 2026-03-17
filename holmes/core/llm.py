@@ -5,13 +5,14 @@ import threading
 import time
 from abc import abstractmethod
 from math import floor
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
 
 import boto3
 import litellm
 import sentry_sdk
 from botocore.exceptions import BotoCoreError
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+from litellm.litellm_core_utils.token_counter import get_image_dimensions
 from litellm.types.utils import ModelResponse, TextCompletionResponse
 from pydantic import BaseModel, ConfigDict, SecretStr
 from typing_extensions import Self
@@ -60,7 +61,7 @@ def get_context_window_compaction_threshold_pct() -> int:
 ROBUSTA_AI_MODEL_NAME = "Robusta"
 
 
-class TokenCountMetadata(BaseModel):
+class ContextWindowUsage(BaseModel):
     total_tokens: int
     tools_tokens: int
     system_tokens: int
@@ -94,6 +95,100 @@ class ModelEntry(BaseModel):
         return cls.model_validate(data)
 
 
+_ANTHROPIC_MODEL_IDENTIFIERS = ("claude", "opus", "sonnet", "haiku")
+
+
+def is_anthropic_model(model_name: str) -> bool:
+    """Check if a model name refers to an Anthropic model.
+
+    Returns True if 'anthropic' is in the name, or if the name contains a
+    known Anthropic model family identifier (e.g. 'claude', 'opus', 'sonnet',
+    'haiku'). This covers all routing prefixes like vertex_ai/, bedrock/,
+    robusta/, etc.
+    """
+    name_lower = model_name.lower()
+    if "anthropic" in name_lower:
+        return True
+    return any(ident in name_lower for ident in _ANTHROPIC_MODEL_IDENTIFIERS)
+
+
+def _get_image_dimensions(url: str) -> Tuple[int, int]:
+    """Get image dimensions from a data URI.
+
+    Delegates to litellm's get_image_dimensions which handles URLs (via HTTP),
+    base64 data URIs, and all major formats (PNG, JPEG, GIF, WebP).
+    Falls back to (768, 768) on any failure.
+    """
+    if not url.startswith("data:"):
+        return 768, 768
+    try:
+        return get_image_dimensions(data=url)
+    except Exception:
+        return 768, 768
+
+
+def _anthropic_image_token_count(width: int, height: int) -> int:
+    """Calculate image tokens using Anthropic's formula.
+
+    Anthropic resizes images to fit within a 1568x1568 bounding box, then
+    charges (width * height) / 750 tokens.
+    See: https://platform.claude.com/docs/en/build-with-claude/vision#calculate-image-costs
+    """
+    max_dim = 1568
+    if width > max_dim or height > max_dim:
+        scale = max_dim / max(width, height)
+        width = int(width * scale)
+        height = int(height * scale)
+    return max(1, (width * height) // 750)
+
+
+def _is_image_block(block: Any) -> bool:
+    """Check if a content block is an image (URL or base64 data URI).
+
+    OpenAI's vision format uses type "image_url" for all image blocks,
+    including base64 data URIs.
+    """
+    return isinstance(block, dict) and block.get("type") == "image_url"
+
+
+def _has_images(message: dict) -> bool:
+    """Check if a message contains any image content blocks."""
+    content = message.get("content")
+    return isinstance(content, list) and any(_is_image_block(b) for b in content)
+
+
+def _strip_images(message: dict) -> dict:
+    """Return a shallow copy of the message with image blocks removed."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    filtered = [b for b in content if not _is_image_block(b)]
+    new_msg = dict(message)
+    new_msg["content"] = filtered if filtered else ""
+    return new_msg
+
+
+def _count_anthropic_image_tokens(message: dict) -> int:
+    """Count image tokens in a message using Anthropic's formula."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return 0
+    image_tokens = 0
+    for block in content:
+        if not _is_image_block(block):
+            continue
+        image_url = block.get("image_url", {})
+        url = (
+            image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
+        )
+        if url:
+            w, h = _get_image_dimensions(url)
+            image_tokens += _anthropic_image_token_count(w, h)
+        else:
+            image_tokens += 1600  # conservative fallback
+    return image_tokens
+
+
 class LLM:
     @abstractmethod
     def __init__(self):
@@ -123,7 +218,7 @@ class LLM:
     @abstractmethod
     def count_tokens(
         self, messages: list[dict], tools: Optional[list[dict[str, Any]]] = None
-    ) -> TokenCountMetadata:
+    ) -> ContextWindowUsage:
         pass
 
     @abstractmethod
@@ -333,17 +428,27 @@ class DefaultLLM(LLM):
         )
         return FALLBACK_CONTEXT_WINDOW_SIZE
 
+    def _is_anthropic_model(self) -> bool:
+        return is_anthropic_model(self.model)
+
     @sentry_sdk.trace
     def count_tokens(
         self, messages: list[dict], tools: Optional[list[dict[str, Any]]] = None
-    ) -> TokenCountMetadata:
+    ) -> ContextWindowUsage:
         t0 = time.monotonic()
+
+        # For Anthropic/Claude models, litellm's token counter severely underestimates
+        # image tokens (uses OpenAI's 85 tokens/image instead of Anthropic's (w*h)/750).
+        # We strip images before litellm counts text, then add correct image tokens.
+        is_anthropic = self._is_anthropic_model()
+
         tools_tokens = 0
         system_tokens = 0
         assistant_tokens = 0
         user_tokens = 0
         other_tokens = 0
         tools_to_call_tokens = 0
+        anthropic_image_tokens = 0
         cached_count = 0
         counted_count = 0
         for message in messages:
@@ -353,6 +458,16 @@ class DefaultLLM(LLM):
             if cached is not None:
                 token_count = cached
                 cached_count += 1
+            elif is_anthropic and _has_images(message):
+                stripped = _strip_images(message)
+                token_count = litellm.token_counter(  # type: ignore
+                    model=self.model, messages=[stripped]
+                )
+                img_tokens = _count_anthropic_image_tokens(message)
+                token_count += img_tokens
+                anthropic_image_tokens += img_tokens
+                message["token_count"] = token_count
+                counted_count += 1
             else:
                 token_count = litellm.token_counter(  # type: ignore
                     model=self.model, messages=[message]
@@ -371,23 +486,33 @@ class DefaultLLM(LLM):
             else:
                 other_tokens += token_count
 
+        # For Anthropic, strip images from bulk calls so litellm doesn't apply its
+        # wrong 85-per-image estimate. We add back the correct image tokens
+        # (already computed in the per-message loop) after.
+        if is_anthropic:
+            bulk_messages = [_strip_images(m) if _has_images(m) else m for m in messages]
+        else:
+            bulk_messages = messages
+
         messages_token_count_without_tools = litellm.token_counter(  # type: ignore
-            model=self.model, messages=messages
+            model=self.model, messages=bulk_messages
         )
 
         total_tokens = litellm.token_counter(  # type: ignore
             model=self.model,
-            messages=messages,
+            messages=bulk_messages,
             tools=tools,  # type: ignore
         )
+
         tools_to_call_tokens = max(0, total_tokens - messages_token_count_without_tools)
+        total_tokens += anthropic_image_tokens
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         logging.debug(
             f"count_tokens: {elapsed_ms:.1f}ms | {len(messages)} msgs ({cached_count} cached, {counted_count} counted) | total={total_tokens}"
         )
 
-        return TokenCountMetadata(
+        return ContextWindowUsage(
             total_tokens=total_tokens,
             system_tokens=system_tokens,
             user_tokens=user_tokens,
@@ -741,13 +866,13 @@ class LLMModelRegistry:
         )
 
 
-def get_llm_usage(
+def build_usage_metadata(
     llm_response: Union[ModelResponse, CustomStreamWrapper, TextCompletionResponse],
 ) -> dict:
     if isinstance(llm_response, CustomStreamWrapper):
         complete_response = litellm.stream_chunk_builder(chunks=llm_response)  # type: ignore
         if complete_response:
-            return get_llm_usage(complete_response)
+            return build_usage_metadata(complete_response)
         return {}
 
     if not (
@@ -759,12 +884,12 @@ def get_llm_usage(
 
     raw = extract_usage_from_response(llm_response)  # type: ignore[arg-type]
     usage: dict = {
-        "prompt_tokens": raw.prompt_tokens,
-        "completion_tokens": raw.completion_tokens,
-        "total_tokens": raw.total_tokens,
+        "prompt_tokens": raw["prompt_tokens"],
+        "completion_tokens": raw["completion_tokens"],
+        "total_tokens": raw["total_tokens"],
     }
-    if raw.cached_tokens is not None:
-        usage["cached_tokens"] = raw.cached_tokens
-    if raw.reasoning_tokens:
-        usage["reasoning_tokens"] = raw.reasoning_tokens
+    if raw["cached_tokens"] is not None:
+        usage["cached_tokens"] = raw["cached_tokens"]
+    if raw["reasoning_tokens"]:
+        usage["reasoning_tokens"] = raw["reasoning_tokens"]
     return usage
