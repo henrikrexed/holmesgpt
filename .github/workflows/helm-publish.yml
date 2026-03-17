@@ -1,0 +1,36 @@
+name: Helm — Package & Push OCI
+
+on:
+  push:
+    branches: [master, main, feat/otel-pr-clean]
+    paths:
+      - "helm/holmes/**"
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CHART_REPO: ghcr.io/henrikrexed
+
+jobs:
+  helm-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Package chart
+        run: helm package helm/holmes
+
+      - name: Push to OCI registry
+        run: |
+          PKG=$(ls *.tgz)
+          helm push "$PKG" oci://${{ env.CHART_REPO }}
