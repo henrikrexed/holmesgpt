@@ -2,7 +2,7 @@ name: Helm — Package & Push OCI
 
 on:
   push:
-    branches: [master, main, feat/otel-pr-clean]
+    branches: [master, main, feat/otel-pr-clean, helm-oci-publish]
     paths:
       - "helm/holmes/**"
   release:
