@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 env:
-  CHART_REPO: ghcr.io/henrikrexed
+  CHART_REPO: ghcr.io/henrikrexed/charts
 
 jobs:
   helm-publish:
